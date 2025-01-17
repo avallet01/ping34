@@ -1,112 +1,113 @@
 import serial
+import numpy as np
+import imufusion
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-# Configuration du port série (remplacez 'COM3' par votre port)
+# Configuration du port série
 ser = serial.Serial('COM3', 115200, timeout=1)
 
-# Initialisation des données
-time_window = 100  # Nombre de points à afficher en temps réel
-time_step = 0.05  # Intervalle de temps entre deux mises à jour en secondes (correspondant à delay dans Arduino)
-data_buffer = {
-    'sensor1_y': [], 'sensor1_z': [],
-    'sensor2_y': [], 'sensor2_z': [],
-    'sensor1_vy': [0], 'sensor1_vz': [0],  # Vitesses initiales (Y, Z) pour capteur 1
-    'sensor2_vy': [0], 'sensor2_vz': [0],  # Vitesses initiales (Y, Z) pour capteur 2
-    'sensor1_py': [0], 'sensor1_pz': [0],  # Positions initiales (Y, Z) pour capteur 1
-    'sensor2_py': [0], 'sensor2_pz': [0]   # Positions initiales (Y, Z) pour capteur 2
-}
-
 # Configuration du graphique
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.set_xlim(-10, 10)  # Ajustez les limites selon vos données
-ax.set_ylim(-10, 10)  # Ajustez les limites selon vos données
-ax.set_title("Simulation en temps réel des mouvements des capteurs")
-ax.set_xlabel("Position Y (m)")
-ax.set_ylabel("Position Z (m)")
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_xlim([-10, 10])
+ax.set_ylim([-10, 10])
+ax.set_zlim([-10, 10])
+ax.set_title("Position Relative en Temps Réel (3D)")
+ax.set_xlabel("Position X (m)")
+ax.set_ylabel("Position Y (m)")
+ax.set_zlabel("Position Z (m)")
 
-# Objets pour l'animation
-sensor1_point, = ax.plot([], [], 'ro', label="Capteur 1")
-sensor2_point, = ax.plot([], [], 'bo', label="Capteur 2")
-sensor1_path, = ax.plot([], [], 'r-', alpha=0.5, label="Trajectoire Capteur 1")
-sensor2_path, = ax.plot([], [], 'b-', alpha=0.5, label="Trajectoire Capteur 2")
+point, = ax.plot([], [], [], 'ro', label="Capteur mobile")
+path, = ax.plot([], [], [], 'r-', alpha=0.5, label="Trajectoire")
 ax.legend()
 
-# Fonction d'initialisation
+trajectory_x, trajectory_y, trajectory_z = [0], [0], [0]
+
+# Classe pour le Filtre de Kalman Étendu
+class EKF:
+    def __init__(self, dt):
+        self.dt = dt
+        self.state = np.zeros(9)  # [x, y, z, vx, vy, vz, bx, by, bz]
+        self.P = np.eye(9) * 0.1
+        self.Q = np.diag([0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.1, 0.1, 0.1])  # Ajusté
+        self.R = np.diag([0.2, 0.2, 0.2])  # Ajusté
+        self.H = np.zeros((3, 9))
+        self.H[:, :3] = np.eye(3)
+
+    def predict(self, acceleration_corrected):
+        F = np.eye(9)
+        F[:3, 3:6] = np.eye(3) * self.dt
+
+        self.state[:3] += self.state[3:6] * self.dt
+        self.state[3:6] += acceleration_corrected * self.dt
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, z):
+        y = z - self.state[:3]
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state += K @ y
+        self.P = (np.eye(9) - K @ self.H) @ self.P
+
+ekf = EKF(dt=0.05)
+fusion_filter = imufusion.Ahrs()
+stabilization_threshold = 0.005
+
+# Calibration des capteurs
+accel_bias, gyro_bias = np.zeros(3), np.zeros(3)
+
 def init():
-    sensor1_point.set_data([], [])
-    sensor2_point.set_data([], [])
-    sensor1_path.set_data([], [])
-    sensor2_path.set_data([], [])
-    return sensor1_point, sensor2_point, sensor1_path, sensor2_path
+    point.set_data([], [])
+    point.set_3d_properties([])
+    path.set_data([], [])
+    path.set_3d_properties([])
+    return point, path
 
-# Fonction de mise à jour
 def update(frame):
-    global data_buffer
+    global trajectory_x, trajectory_y, trajectory_z
 
-    # Lire une ligne du port série
     line = ser.readline().decode('utf-8').strip()
     if line:
-        print(f"Reçu : {line}")  # Débogage : afficher les données brutes
-        parts = line.split(",")
-        if len(parts) == 11:
-            sensor = parts[0]
-            try:
-                temp, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z = map(float, parts[1:])
+        try:
+            parts = line.split(",")
+            if len(parts) == 11:
+                _, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, _, _, _ = map(float, parts[1:])
+                accelerometer = np.array([accel_x, accel_y, accel_z]) - accel_bias
+                gyroscope = np.array([gyro_x, gyro_y, gyro_z]) - gyro_bias
 
-                # Mise à jour des vitesses et positions par intégration
-                if sensor == "C1":
-                    # Calcul des vitesses
-                    vy = data_buffer['sensor1_vy'][-1] + accel_y * time_step
-                    vz = data_buffer['sensor1_vz'][-1] + accel_z * time_step
-                    data_buffer['sensor1_vy'].append(vy)
-                    data_buffer['sensor1_vz'].append(vz)
+                # Mise à jour du filtre de fusion
+                fusion_filter.update_no_magnetometer(gyroscope, accelerometer, ekf.dt)
+                gravity = fusion_filter.gravity
+                acceleration_corrected = accelerometer - gravity
 
-                    # Calcul des positions
-                    py = data_buffer['sensor1_py'][-1] + vy * time_step
-                    pz = data_buffer['sensor1_pz'][-1] + vz * time_step
-                    data_buffer['sensor1_py'].append(py)
-                    data_buffer['sensor1_pz'].append(pz)
+                # Stabilisation si immobile
+                if np.linalg.norm(acceleration_corrected) < stabilization_threshold and np.linalg.norm(gyroscope) < stabilization_threshold:
+                    ekf.state[3:6] *= 0.9  # Réduction de la vitesse
+                    ekf.state[6:9] *= 0.99  # Réduction des biais
 
-                elif sensor == "C2":
-                    # Calcul des vitesses
-                    vy = data_buffer['sensor2_vy'][-1] + accel_y * time_step
-                    vz = data_buffer['sensor2_vz'][-1] + accel_z * time_step
-                    data_buffer['sensor2_vy'].append(vy)
-                    data_buffer['sensor2_vz'].append(vz)
+                # Prédiction et mise à jour EKF
+                ekf.predict(acceleration_corrected)
 
-                    # Calcul des positions
-                    py = data_buffer['sensor2_py'][-1] + vy * time_step
-                    pz = data_buffer['sensor2_pz'][-1] + vz * time_step
-                    data_buffer['sensor2_py'].append(py)
-                    data_buffer['sensor2_pz'].append(pz)
+                # Mise à jour des trajectoires
+                simulated_position = ekf.state[:3]
+                trajectory_x.append(simulated_position[0])
+                trajectory_y.append(simulated_position[1])
+                trajectory_z.append(simulated_position[2])
 
-                # Conserver uniquement les derniers points
-                for key in data_buffer:
-                    if len(data_buffer[key]) > time_window:
-                        data_buffer[key] = data_buffer[key][-time_window:]
+                trajectory_x = trajectory_x[-100:]
+                trajectory_y = trajectory_y[-100:]
+                trajectory_z = trajectory_z[-100:]
 
-            except ValueError:
-                print("Erreur : Données mal formatées, ignorées.")
+        except ValueError:
+            print("Erreur : Données mal formatées")
 
-    # Mettre à jour les graphiques
-    if data_buffer['sensor1_py'] and data_buffer['sensor1_pz']:
-        sensor1_point.set_data(data_buffer['sensor1_py'][-1:], data_buffer['sensor1_pz'][-1:])
-        sensor1_path.set_data(data_buffer['sensor1_py'], data_buffer['sensor1_pz'])
+    point.set_data(trajectory_x[-1:], trajectory_y[-1:])
+    point.set_3d_properties(trajectory_z[-1:])
+    path.set_data(trajectory_x, trajectory_y)
+    path.set_3d_properties(trajectory_z)
 
-    if data_buffer['sensor2_py'] and data_buffer['sensor2_pz']:
-        sensor2_point.set_data(data_buffer['sensor2_py'][-1:], data_buffer['sensor2_pz'][-1:])
-        sensor2_path.set_data(data_buffer['sensor2_py'], data_buffer['sensor2_pz'])
+    return point, path
 
-    # Calcul et affichage de la position relative
-    if data_buffer['sensor1_py'] and data_buffer['sensor2_py']:
-        relative_py = data_buffer['sensor1_py'][-1] - data_buffer['sensor2_py'][-1]
-        relative_pz = data_buffer['sensor1_pz'][-1] - data_buffer['sensor2_pz'][-1]
-        print(f"Position relative (Y, Z) : ({relative_py:.2f}, {relative_pz:.2f})")
-
-    return sensor1_point, sensor2_point, sensor1_path, sensor2_path
-
-# Animation
 ani = FuncAnimation(fig, update, init_func=init, interval=50, blit=False)
-
 plt.show()
